@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": ".fixture-runtime",
+    "noEmit": false
+  },
+  "include": [
+    "tests/support/local-ivac-fixture.ts",
+    "tests/support/runtime-fixture-server.ts"
+  ]
+}

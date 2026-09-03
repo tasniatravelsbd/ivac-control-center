@@ -1,0 +1,1 @@
+export class IdempotencyGuard { private completed=new Set<string>(); private running=new Set<string>(); async once<T>(key:string,work:()=>Promise<T>){if(this.completed.has(key)||this.running.has(key))throw new Error('SIDE_EFFECT_ALREADY_ATTEMPTED');this.running.add(key);try{const value=await work();this.completed.add(key);return value}finally{this.running.delete(key)}} }

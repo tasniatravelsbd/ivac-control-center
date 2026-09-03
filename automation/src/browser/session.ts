@@ -1,0 +1,2 @@
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright'
+export class BrowserSession { browser?:Browser; context?:BrowserContext; page?:Page; async open(){ this.browser=await chromium.launch({headless:process.env.WORKER_HEADLESS !== 'false'}); this.context=await this.browser.newContext(); this.page=await this.context.newPage(); return this.page } async cleanup(){ await this.context?.close().catch(()=>undefined); await this.browser?.close().catch(()=>undefined) } }

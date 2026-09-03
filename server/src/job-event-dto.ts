@@ -1,0 +1,3 @@
+/** Shared safe shape for API/UI timelines. Never add browser/session secrets here. */
+export type JobEventDto={jobId:string;applicationId:string;workerId:string|null;state:string;event:string;errorCode?:string;timestamp:string;durationMs?:number}
+export function toJobEventDto(input:{jobId:string;applicationId:string;workerId?:string|null;state:string;message:string;createdAt:Date;errorCode?:string;durationMs?:number}):JobEventDto{return {jobId:input.jobId,applicationId:input.applicationId,workerId:input.workerId??null,state:input.state,event:input.message,errorCode:input.errorCode,timestamp:input.createdAt.toISOString(),durationMs:input.durationMs}}

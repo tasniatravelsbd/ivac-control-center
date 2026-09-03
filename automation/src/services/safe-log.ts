@@ -1,0 +1,1 @@
+export function safeLog(event:string,data:{jobId?:string;applicationId?:string;workerId?:string;state?:string;errorCode?:string;retryCount?:number}={}){console.info(JSON.stringify({event,...data,timestamp:new Date().toISOString()}))}

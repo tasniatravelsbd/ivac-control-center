@@ -1,0 +1,349 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum ApplicationStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum AutomationStatus {
+  NOT_STARTED
+  QUEUED
+  PAUSED
+  FAILED
+}
+
+enum DocumentKind {
+  BGDR
+}
+
+enum CollectorStatus {
+  ONLINE
+  DEGRADED
+  OFFLINE
+  DISABLED
+}
+
+enum SmsStatus {
+  NEW
+  MATCHED
+  UNMATCHED
+  PROCESSED
+  IGNORED
+  DUPLICATE
+  NEEDS_REVIEW
+  EXPIRED
+}
+
+enum AutomationJobState {
+  QUEUED
+  STARTING
+  OPENING_BROWSER
+  LOGGING_IN
+  CHECK_VERIFICATION
+  VERIFICATION_REQUIRED
+  LOGIN_SUBMITTED
+  OTP_PAGE_REACHED
+  REQUESTING_OTP
+  WAITING_FOR_OTP
+  OTP_RECEIVED
+  SUBMITTING_OTP
+  AUTHENTICATED
+  OTP_TIMEOUT
+  OTP_REJECTED
+  OTP_MATCH_AMBIGUOUS
+  NEEDS_ATTENTION
+  UPLOADING_DOCUMENT
+  DOCUMENT_UPLOADED
+  CONFIRMING_INFORMATION
+  SELECTING_MISSION
+  SELECTING_CENTRE
+  WAITING_FOR_SLOT
+  SLOT_FOUND
+  SELECTING_DATE
+  DATE_SELECTED
+  CONTINUING_BOOKING
+  PREPARING_PAYMENT
+  PAYMENT_READY
+  PAUSED
+  RETRYING
+  FAILED
+  CANCELLED
+  COMPLETED
+}
+
+enum WorkerCommandType {
+  FOCUS_PAYMENT_PAGE
+  MARK_PAYMENT_COMPLETED
+  MARK_PAYMENT_FAILED
+  CLEANUP_JOB_SESSION
+}
+
+enum WorkerCommandStatus {
+  PENDING
+  CLAIMED
+  COMPLETED
+  FAILED
+  EXPIRED
+}
+
+model User {
+  id                   String                @id @default(cuid())
+  name                 String
+  email                String                @unique
+  passwordHash         String                @map("password_hash")
+  createdAt            DateTime              @default(now()) @map("created_at")
+  updatedAt            DateTime              @updatedAt @map("updated_at")
+  assignedApplications Application[]         @relation("assigned_user")
+  createdApplications  Application[]         @relation("created_by")
+  uploadedDocuments    ApplicationDocument[] @relation("uploaded_by")
+  events               ApplicationEvent[]    @relation("event_actor")
+
+  @@map("users")
+}
+
+model Application {
+  id               String                 @id @default(cuid())
+  fullName         String                 @map("full_name")
+  webfileNumber    String                 @unique @map("webfile_number")
+  email            String
+  primaryPhone     String                 @map("primary_phone")
+  otpReceiverPhone String                 @map("otp_receiver_phone")
+  notes            String?                @db.Text
+  status           ApplicationStatus      @default(DRAFT)
+  automationStatus AutomationStatus       @default(NOT_STARTED) @map("automation_status")
+  assignedUserId   String?                @map("assigned_user_id")
+  createdBy        String                 @map("created_by")
+  createdAt        DateTime               @default(now()) @map("created_at")
+  updatedAt        DateTime               @updatedAt @map("updated_at")
+  assignedUser     User?                  @relation("assigned_user", fields: [assignedUserId], references: [id], onDelete: SetNull)
+  creator          User                   @relation("created_by", fields: [createdBy], references: [id])
+  credentials      ApplicationCredential?
+  preference       AppointmentPreference?
+  documents        ApplicationDocument[]
+  events           ApplicationEvent[]
+  smsMessages      SmsMessage[]           @relation("matched_application")
+  otpMatches       OtpMatch[]
+  automationJobs   AutomationJob[]
+
+  @@index([fullName])
+  @@index([primaryPhone])
+  @@index([status])
+  @@index([assignedUserId])
+  @@map("applications")
+}
+
+model AutomationWorker {
+  id              String          @id @default(cuid())
+  workerName      String          @unique @map("worker_name")
+  apiKeyHash      String          @map("api_key_hash")
+  status          String          @default("OFFLINE")
+  lastHeartbeatAt DateTime?       @map("last_heartbeat_at")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  jobs            AutomationJob[]
+  workerCommands  WorkerCommand[] @relation("worker_commands")
+
+  @@map("automation_workers")
+}
+
+model AutomationJob {
+  id            String               @id @default(cuid())
+  applicationId String               @map("application_id")
+  state         AutomationJobState   @default(QUEUED)
+  workerId      String?              @map("worker_id")
+  claimedAt     DateTime?            @map("claimed_at")
+  pausedAt      DateTime?            @map("paused_at")
+  retryCount    Int                  @default(0) @map("retry_count")
+  lastErrorCode String?              @map("last_error_code")
+  createdAt     DateTime             @default(now()) @map("created_at")
+  updatedAt     DateTime             @updatedAt @map("updated_at")
+  application   Application          @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  worker        AutomationWorker?    @relation(fields: [workerId], references: [id], onDelete: SetNull)
+  events        AutomationJobEvent[]
+  commands      WorkerCommand[]
+
+  @@index([state, createdAt])
+  @@map("automation_jobs")
+}
+
+model WorkerCommand {
+  id             String              @id @default(cuid())
+  jobId          String              @map("job_id")
+  workerId       String              @map("worker_id")
+  commandType    WorkerCommandType   @map("command_type")
+  status         WorkerCommandStatus @default(PENDING)
+  errorCode      String?             @map("error_code")
+  createdAt      DateTime            @default(now()) @map("created_at")
+  acknowledgedAt DateTime?           @map("acknowledged_at")
+  completedAt    DateTime?           @map("completed_at")
+  expiresAt      DateTime            @map("expires_at")
+  job            AutomationJob       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  worker         AutomationWorker    @relation("worker_commands", fields: [workerId], references: [id], onDelete: Cascade)
+
+  @@index([workerId, status, expiresAt])
+  @@map("worker_commands")
+}
+
+model AutomationJobEvent {
+  id          String             @id @default(cuid())
+  jobId       String             @map("job_id")
+  state       AutomationJobState
+  message     String             @db.VarChar(500)
+  diagnostics Json?
+  createdAt   DateTime           @default(now()) @map("created_at")
+  job         AutomationJob      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId, createdAt])
+  @@map("automation_job_events")
+}
+
+model SmsCollector {
+  id               String             @id @default(cuid())
+  deviceName       String             @map("device_name")
+  deviceIdentifier String             @unique @map("device_identifier")
+  apiKeyHash       String             @map("api_key_hash")
+  phoneNumber      String             @map("phone_number")
+  status           CollectorStatus    @default(OFFLINE)
+  lastHeartbeatAt  DateTime?          @map("last_heartbeat_at")
+  createdAt        DateTime           @default(now()) @map("created_at")
+  updatedAt        DateTime           @updatedAt @map("updated_at")
+  messages         SmsMessage[]
+  events           CollectorEvent[]
+  pairings         CollectorPairing[]
+
+  @@index([status, lastHeartbeatAt])
+  @@map("sms_collectors")
+}
+
+model CollectorPairing {
+  id                    String       @id @default(cuid())
+  collectorId           String       @map("collector_id")
+  codeHash              String       @unique @map("code_hash")
+  encryptedCollectorKey String       @map("encrypted_collector_key") @db.Text
+  backendUrl            String       @map("backend_url") @db.VarChar(2048)
+  expiresAt             DateTime     @map("expires_at")
+  consumedAt            DateTime?    @map("consumed_at")
+  createdAt             DateTime     @default(now()) @map("created_at")
+  collector             SmsCollector @relation(fields: [collectorId], references: [id], onDelete: Cascade)
+
+  @@index([collectorId, expiresAt])
+  @@map("collector_pairings")
+}
+
+model SmsMessage {
+  id                    String       @id @default(cuid())
+  collectorId           String       @map("collector_id")
+  messageUid            String       @unique @map("message_uid")
+  receiverNumber        String       @map("receiver_number")
+  senderNumber          String       @map("sender_number")
+  messageText           String       @map("message_text") @db.Text
+  encryptedOtpCandidate String?      @map("encrypted_otp_candidate") @db.Text
+  receivedAt            DateTime     @map("received_at")
+  status                SmsStatus    @default(NEW)
+  matchedApplicationId  String?      @map("matched_application_id")
+  processedAt           DateTime?    @map("processed_at")
+  createdAt             DateTime     @default(now()) @map("created_at")
+  collector             SmsCollector @relation(fields: [collectorId], references: [id], onDelete: Restrict)
+  matchedApplication    Application? @relation("matched_application", fields: [matchedApplicationId], references: [id], onDelete: SetNull)
+  otpMatch              OtpMatch?
+
+  @@index([receiverNumber, receivedAt])
+  @@index([status, receivedAt])
+  @@map("sms_messages")
+}
+
+model OtpMatch {
+  id                String      @id @default(cuid())
+  smsMessageId      String      @unique @map("sms_message_id")
+  applicationId     String      @map("application_id")
+  automationJobId   String?     @map("automation_job_id")
+  encryptedOtpValue String      @map("encrypted_otp_value") @db.Text
+  matchedAt         DateTime    @default(now()) @map("matched_at")
+  consumedAt        DateTime?   @map("consumed_at")
+  expiresAt         DateTime    @map("expires_at")
+  smsMessage        SmsMessage  @relation(fields: [smsMessageId], references: [id], onDelete: Cascade)
+  application       Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId, expiresAt])
+  @@map("otp_matches")
+}
+
+model CollectorEvent {
+  id          String       @id @default(cuid())
+  collectorId String       @map("collector_id")
+  type        String
+  message     String       @db.VarChar(500)
+  createdAt   DateTime     @default(now()) @map("created_at")
+  collector   SmsCollector @relation(fields: [collectorId], references: [id], onDelete: Cascade)
+
+  @@index([collectorId, createdAt])
+  @@map("collector_events")
+}
+
+model ApplicationCredential {
+  id                     String      @id @default(cuid())
+  applicationId          String      @unique @map("application_id")
+  loginPhone             String      @map("login_phone")
+  encryptedLoginPassword String      @map("encrypted_login_password") @db.Text
+  createdAt              DateTime    @default(now()) @map("created_at")
+  updatedAt              DateTime    @updatedAt @map("updated_at")
+  application            Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@map("application_credentials")
+}
+
+model AppointmentPreference {
+  id                    String      @id @default(cuid())
+  applicationId         String      @unique @map("application_id")
+  mission               String
+  ivacCentre            String      @map("ivac_centre")
+  visaType              String      @map("visa_type")
+  preferredDate         DateTime?   @map("preferred_date") @db.Date
+  allowAlternativeDates Boolean     @default(false) @map("allow_alternative_dates")
+  allowedDateFrom       DateTime?   @map("allowed_date_from") @db.Date
+  allowedDateTo         DateTime?   @map("allowed_date_to") @db.Date
+  application           Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([mission, ivacCentre, visaType])
+  @@map("appointment_preferences")
+}
+
+model ApplicationDocument {
+  id               String       @id @default(cuid())
+  applicationId    String       @map("application_id")
+  kind             DocumentKind @default(BGDR)
+  originalFilename String       @map("original_filename")
+  mimeType         String       @map("mime_type")
+  size             Int
+  storedPath       String       @unique @map("stored_path")
+  uploadedBy       String       @map("uploaded_by")
+  uploadedAt       DateTime     @default(now()) @map("uploaded_at")
+  application      Application  @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  uploader         User         @relation("uploaded_by", fields: [uploadedBy], references: [id])
+
+  @@unique([applicationId, kind])
+  @@map("application_documents")
+}
+
+model ApplicationEvent {
+  id            String      @id @default(cuid())
+  applicationId String      @map("application_id")
+  actorId       String      @map("actor_id")
+  type          String
+  message       String      @db.VarChar(500)
+  metadata      Json?
+  createdAt     DateTime    @default(now()) @map("created_at")
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  actor         User        @relation("event_actor", fields: [actorId], references: [id])
+
+  @@index([applicationId, createdAt])
+  @@map("application_events")
+}

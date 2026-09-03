@@ -1,0 +1,1 @@
+export async function retry<T>(work:()=>Promise<T>, temporary:(e:unknown)=>boolean, attempts=Number(process.env.WORKER_MAX_RETRIES??3)){ let error:unknown; for(let i=0;i<attempts;i++){ try{return await work()}catch(e){error=e;if(!temporary(e)||i===attempts-1)break; await new Promise(r=>setTimeout(r,Math.min(5000,200*2**i)+Math.random()*100))} } throw error }

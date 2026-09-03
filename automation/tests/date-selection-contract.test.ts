@@ -1,0 +1,3 @@
+import { describe,it,expect } from 'vitest'
+import { ActiveJobRegistry } from '../src/coordinator/active-job-registry.js'
+describe('stored date candidate contract',()=>{it('uses one exact isolated candidate',()=>{const r=new ActiveJobRegistry(),s={cleanup:async()=>{}} as any;r.register({jobId:'one',applicationId:'one',session:s,state:'PREFERRED_AVAILABLE',paused:false,cancelled:false});r.setSlotCandidate('one',{classification:'PREFERRED_AVAILABLE',allowedDates:['2026-09-03'],bestCandidate:'2026-09-03',checkedAt:new Date().toISOString()});expect(r.getBestCandidateDate('one')).toBe('2026-09-03')})})
