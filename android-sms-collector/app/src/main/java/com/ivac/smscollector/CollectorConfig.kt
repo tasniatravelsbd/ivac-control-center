@@ -1,8 +1,10 @@
 package com.ivac.smscollector
 
 import android.content.Context
+import android.util.Base64
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import java.security.SecureRandom
 import java.util.UUID
 
 data class CollectorConfig(
@@ -11,6 +13,7 @@ data class CollectorConfig(
     val deviceIdentifier: String,
     val receiverNumber: String,
     val hasApiKey: Boolean,
+    val hasRegistrationSecret: Boolean,
 )
 
 class CollectorConfigStore(context: Context) {
@@ -29,9 +32,28 @@ class CollectorConfigStore(context: Context) {
         deviceIdentifier = deviceIdentifier(),
         receiverNumber = normal.getString("receiver_number", "") ?: "",
         hasApiKey = !encrypted.getString("collector_api_key", "").isNullOrBlank(),
+        hasRegistrationSecret = !encrypted.getString("registration_secret", "").isNullOrBlank(),
     )
 
     fun apiKey(): String? = encrypted.getString("collector_api_key", null)
+
+    fun registrationSecret(): String? = encrypted.getString("registration_secret", null)
+
+    fun beginRegistration(backendUrl: String, deviceName: String, receiverNumber: String): CollectorConfig {
+        if (registrationSecret().isNullOrBlank()) {
+            val bytes = ByteArray(32)
+            SecureRandom().nextBytes(bytes)
+            encrypted.edit()
+                .putString("registration_secret", Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING))
+                .apply()
+        }
+        normal.edit()
+            .putString("backend_url", backendUrl.trim().trimEnd('/'))
+            .putString("device_name", deviceName.trim())
+            .putString("receiver_number", receiverNumber.trim())
+            .apply()
+        return read()
+    }
 
     fun recordHeartbeat(status: String) {
         normal.edit().putString("last_heartbeat_status", status).putLong("last_heartbeat_at", System.currentTimeMillis()).apply()
@@ -67,18 +89,20 @@ class CollectorConfigStore(context: Context) {
         if (!apiKey.isNullOrBlank()) encrypted.edit().putString("collector_api_key", apiKey.trim()).apply()
     }
 
-    /** Saves the one-time pairing response. The credential remains in encrypted storage only. */
-    fun savePaired(backendUrl: String, deviceName: String, deviceIdentifier: String, receiverNumber: String, apiKey: String) {
+    /** Saves a one-time approved registration response. The credential remains in encrypted storage only. */
+    fun saveRegistered(backendUrl: String, deviceName: String, deviceIdentifier: String, receiverNumber: String, apiKey: String) {
         save(backendUrl, deviceName, deviceIdentifier, receiverNumber, apiKey)
+        encrypted.edit().remove("registration_secret").apply()
     }
 
-    /** Re-pairing is an explicit operator action; it clears the local credential before a new code is used. */
-    fun clearPairing() {
+    /** Re-registration is explicit; it clears the local identity and credential. */
+    fun clearRegistration() {
         normal.edit()
             .remove("backend_url")
             .remove("device_name")
+            .remove("device_identifier")
             .remove("receiver_number")
             .apply()
-        encrypted.edit().remove("collector_api_key").apply()
+        encrypted.edit().remove("collector_api_key").remove("registration_secret").apply()
     }
 }

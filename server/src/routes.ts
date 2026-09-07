@@ -12,10 +12,45 @@ import { env } from './config.js'
 import { decryptSecret, encryptSecret } from './crypto.js'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { z } from 'zod'
-import { authenticateCollector, matchIncomingSms, normalizeBangladeshPhone, provisionCollector } from './sms.js'
+import { authenticateCollector, authenticateRegistration, matchIncomingSms, normalizeBangladeshPhone, provisionCollector, requestDeviceRegistration } from './sms.js'
 
 const router = Router()
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: env.DOCUMENT_MAX_SIZE_MB * 1024 * 1024 }, fileFilter: (_req, file, cb) => cb(null, file.mimetype === 'application/pdf' && file.originalname.toLowerCase().endsWith('.pdf')) })
+
+function maskPhone(phone: string) {
+  const visible = phone.slice(-4)
+  return `${'•'.repeat(Math.max(0, phone.length - visible.length))}${visible}`
+}
+
+function diagnosticsOf(event: { diagnostics: unknown }) {
+  return (event.diagnostics && typeof event.diagnostics === 'object' ? event.diagnostics : {}) as Record<string, unknown>
+}
+
+async function automationReadiness(application: {
+  credentials: { loginPhone: string; encryptedLoginPassword: string } | null
+  preference: { mission: string; ivacCentre: string; visaType: string } | null
+  documents: { kind: string; mimeType: string; slot: number }[]
+}) {
+  const heartbeatSince = new Date(Date.now() - 120_000)
+  const [healthyWorkerCount, collectorCount] = await Promise.all([
+    prisma.automationWorker.count({ where: { status: 'ONLINE', lastHeartbeatAt: { gte: heartbeatSince } } }),
+    prisma.smsCollector.count({ where: { status: 'ONLINE', lastHeartbeatAt: { gte: heartbeatSince } } }),
+  ])
+  const preference = application.preference
+  const checks = [
+    { key: 'IVAC_PHONE', label: 'IVAC phone', required: true, ok: !!application.credentials?.loginPhone.trim() },
+    { key: 'ENCRYPTED_PASSWORD', label: 'Encrypted password', required: true, ok: !!application.credentials?.encryptedLoginPassword },
+    { key: 'BGDR', label: 'Primary BGDR PDF', required: true, ok: application.documents.some(document => document.kind === 'BGDR' && document.slot === 1 && document.mimeType === 'application/pdf') },
+    { key: 'MISSION', label: 'Mission', required: true, ok: !!preference?.mission.trim() },
+    { key: 'IVAC_CENTRE', label: 'IVAC centre', required: true, ok: !!preference?.ivacCentre.trim() },
+    { key: 'PREFERENCES', label: 'Application preferences', required: true, ok: !!preference?.visaType.trim() },
+    { key: 'HEALTHY_WORKER', label: 'Healthy worker', required: true, ok: healthyWorkerCount > 0 },
+  ]
+  return {
+    ready: checks.every(check => check.ok), checks,
+    smsCollector: { status: collectorCount > 0 ? 'ONLINE' : 'OFFLINE', onlineCount: collectorCount, warning: collectorCount === 0 ? 'No healthy SMS collector is online. OTP delivery may require manual recovery.' : null },
+  }
+}
 
 router.post('/auth/login', async (req, res) => {
   const input = z.object({ email: z.string().email(), password: z.string().min(1) }).safeParse(req.body)
@@ -27,13 +62,12 @@ router.post('/auth/login', async (req, res) => {
 router.post('/applications/:applicationId/automation-jobs', async (req: AuthRequest, res) => {
   const application = await prisma.application.findFirst({
     where: { id: req.params.applicationId, OR: [{ createdBy: req.userId }, { assignedUserId: req.userId }] },
-    include: { credentials: true, preference: true, documents: { where: { kind: 'BGDR' }, take: 1 } },
+    include: { credentials: true, preference: true, documents: { where: { kind: 'BGDR' }, orderBy: { slot: 'asc' }, take: 1 } },
   })
   if (!application) return res.status(404).json({ error: 'Application not found' })
   if (application.status !== 'ACTIVE') return res.status(409).json({ error: 'Application must be active before automation can start' })
-  if (!application.credentials || !application.preference || !application.documents.length) {
-    return res.status(422).json({ error: 'Application requires credentials, preferences, and a BGDR document before automation can start' })
-  }
+  const readiness = await automationReadiness(application)
+  if (!readiness.ready) return res.status(422).json({ error: 'Application is not ready for automation', readiness })
   const activeJob = await prisma.automationJob.findFirst({
     where: { applicationId: application.id, state: { notIn: ['COMPLETED', 'FAILED', 'CANCELLED'] } },
     select: { id: true, state: true },
@@ -49,19 +83,125 @@ router.post('/applications/:applicationId/automation-jobs', async (req: AuthRequ
   })
   res.status(201).json({ id: job.id, applicationId: job.applicationId, state: job.state, createdAt: job.createdAt, updatedAt: job.updatedAt })
 })
-router.get('/jobs', async (req: AuthRequest, res) => { const data = await prisma.automationJob.findMany({ where: { application: { createdBy: req.userId } }, include: { application: { select: { id: true, fullName: true, webfileNumber: true } }, worker:{select:{id:true,workerName:true,lastHeartbeatAt:true,status:true}}, events:{orderBy:{createdAt:'desc'},take:1} }, orderBy: { updatedAt: 'desc' } }); res.json({ data: data.map(j=>({id:j.id,state:j.state,retryCount:j.retryCount,lastErrorCode:j.lastErrorCode,updatedAt:j.updatedAt,application:j.application,worker:j.worker,latestEvent:j.events[0]?{state:j.events[0].state,event:j.events[0].message,errorCode:(j.events[0].diagnostics as any)?.errorCode,timestamp:j.events[0].createdAt}:null})) }) })
+router.get('/applications/:applicationId/automation-readiness', async (req: AuthRequest, res) => {
+  const application = await prisma.application.findFirst({
+    where: { id: req.params.applicationId, OR: [{ createdBy: req.userId }, { assignedUserId: req.userId }] },
+    include: { credentials: true, preference: true, documents: { select: { kind: true, mimeType: true, slot: true } } },
+  })
+  if (!application) return res.status(404).json({ error: 'Application not found' })
+  res.json(await automationReadiness(application))
+})
+router.get('/jobs', async (req: AuthRequest, res) => {
+  const data = await prisma.automationJob.findMany({
+    where: { application: { createdBy: req.userId } },
+    include: {
+      application: { select: { id: true, fullName: true, webfileNumber: true, primaryPhone: true } },
+      worker: { select: { id: true, workerName: true, lastHeartbeatAt: true, status: true } },
+      events: { orderBy: { createdAt: 'desc' }, take: 50 },
+    },
+    orderBy: { updatedAt: 'desc' },
+  })
+  const otpMatches = await prisma.otpMatch.findMany({
+    where: { automationJobId: { in: data.map(job => job.id) } },
+    select: { automationJobId: true, consumedAt: true, expiresAt: true },
+  })
+  const otpByJob = new Map(otpMatches.map(match => [match.automationJobId, match]))
+  const now = Date.now()
+  res.json({ data: data.map(job => {
+    const handoff = job.events.find(event => diagnosticsOf(event).paymentMode)
+    const metadata = handoff ? diagnosticsOf(handoff) : {}
+    const slotEvent = job.events.find(event => typeof diagnosticsOf(event).slotStatus === 'string')
+    const slotMetadata = slotEvent ? diagnosticsOf(slotEvent) : {}
+    const latestEvent = job.events[0]
+    const otp = otpByJob.get(job.id)
+    const otpStatus = job.state === 'WAITING_FOR_OTP'
+      ? otp && !otp.consumedAt && otp.expiresAt.getTime() > now ? 'AVAILABLE' : 'WAITING'
+      : job.state === 'OTP_RECEIVED' || job.state === 'SUBMITTING_OTP' ? 'CLAIMED'
+      : otp?.consumedAt ? 'CONSUMED' : 'NOT_REQUIRED'
+    return {
+      id: job.id, state: job.state, retryCount: job.retryCount, lastErrorCode: job.lastErrorCode,
+      createdAt: job.createdAt, updatedAt: job.updatedAt,
+      application: { id: job.application.id, fullName: job.application.fullName, webfileNumber: job.application.webfileNumber, maskedPhone: maskPhone(job.application.primaryPhone) },
+      worker: job.worker,
+      currentStage: job.state,
+      elapsedMs: now - job.createdAt.getTime(),
+      lastSuccessfulStage: job.lastSuccessfulStage,
+      otpStatus,
+      slotStatus: typeof slotMetadata.slotStatus === 'string' ? slotMetadata.slotStatus : 'UNKNOWN',
+      paymentStatus: job.state === 'PAYMENT_READY' ? 'READY' : ['PREPARING_PAYMENT', 'CONTINUING_BOOKING'].includes(job.state) ? 'PREPARING' : 'NOT_READY',
+      latestSafeError: job.lastErrorCode ?? (typeof diagnosticsOf(latestEvent ?? { diagnostics: null }).errorCode === 'string' ? String(diagnosticsOf(latestEvent!).errorCode) : null),
+      latestEvent: latestEvent ? { state: latestEvent.state, event: latestEvent.message, errorCode: diagnosticsOf(latestEvent).errorCode as string | undefined, timestamp: latestEvent.createdAt } : null,
+      paymentHandoff: handoff ? { mode: metadata.paymentMode, provider: metadata.paymentProvider ?? null, destinationHost: metadata.destinationHost ?? null, destinationUrl: metadata.destinationUrl ?? null, reference: metadata.paymentReference ?? null, generatedAt: handoff.createdAt } : null,
+    }
+  }) })
+})
+router.get('/operations/summary', async (req: AuthRequest, res) => {
+  const [workers, collectors, activeApplications, readyApplications, currentJobs] = await Promise.all([
+    prisma.automationWorker.findMany({ select: { status: true, lastHeartbeatAt: true } }),
+    prisma.smsCollector.findMany({ where: { status: { not: 'DISABLED' } }, select: { status: true, lastHeartbeatAt: true } }),
+    prisma.application.count({ where: { createdBy: req.userId, status: 'ACTIVE' } }),
+    prisma.application.count({ where: { createdBy: req.userId, status: 'ACTIVE', credentials: { isNot: null }, preference: { isNot: null }, documents: { some: { kind: 'BGDR' } } } }),
+    prisma.automationJob.groupBy({ where: { application: { createdBy: req.userId }, state: { notIn: ['COMPLETED', 'FAILED', 'CANCELLED'] } }, by: ['state'], _count: { _all: true } }),
+  ])
+  const heartbeatWindow = Date.now() - 120_000
+  res.json({
+    backend: 'ONLINE',
+    database: 'CONNECTED',
+    workers: { online: workers.filter(worker => worker.lastHeartbeatAt && worker.lastHeartbeatAt.getTime() >= heartbeatWindow).length, total: workers.length },
+    collectors: { online: collectors.filter(collector => collector.lastHeartbeatAt && collector.lastHeartbeatAt.getTime() >= heartbeatWindow).length, total: collectors.length },
+    applications: { ready: readyApplications, active: activeApplications },
+    jobs: currentJobs.map(job => ({ state: job.state, count: job._count._all })),
+  })
+})
 router.get('/jobs/:id/timeline',async(req:AuthRequest,res)=>{const job=await prisma.automationJob.findFirst({where:{id:req.params.id,application:{createdBy:req.userId}},include:{events:{orderBy:{createdAt:'asc'}},application:{select:{id:true}},worker:{select:{id:true}}}});if(!job)return res.status(404).json({error:'Job not found'});res.json({data:job.events.map(e=>({jobId:job.id,applicationId:job.application.id,workerId:job.worker?.id??null,state:e.state,event:e.message,errorCode:(e.diagnostics as any)?.errorCode,timestamp:e.createdAt,durationMs:(e.diagnostics as any)?.durationMs}))})})
 router.get('/workers/health',async(_req:AuthRequest,res)=>{const workers=await prisma.automationWorker.findMany({include:{jobs:{where:{state:{notIn:['COMPLETED','FAILED','CANCELLED']}}}}});res.json({data:workers.map(w=>({id:w.id,online:!!w.lastHeartbeatAt&&Date.now()-w.lastHeartbeatAt.getTime()<120000,activeJobCount:w.jobs.length,staleSessionCount:0,retryCount:w.jobs.reduce((n,j)=>n+j.retryCount,0),lastHeartbeat:w.lastHeartbeatAt}))})})
-router.post('/jobs/:id/resume', async (req: AuthRequest, res) => { const job = await prisma.automationJob.findFirst({ where: { id: req.params.id, application: { createdBy: req.userId }, state: { in: ['VERIFICATION_REQUIRED','PAUSED'] } } }); if (!job) return res.status(409).json({ error: 'Job is not ready to resume' }); await prisma.$transaction([prisma.automationJob.update({ where: { id: job.id }, data: { state: 'RETRYING', pausedAt: null } }), prisma.automationJobEvent.create({ data: { jobId: job.id, state: 'RETRYING', message: 'Operator requested resume after verification' } })]); res.json({ ok: true }) })
-router.post('/jobs/:id/commands/:commandType',async(req:AuthRequest,res)=>{const type=z.enum(['focus-payment','mark-payment-completed','mark-payment-failed','cleanup-session']).safeParse(req.params.commandType);if(!type.success)return res.status(422).json({error:'Unsupported command'});const job=await prisma.automationJob.findFirst({where:{id:req.params.id,application:{createdBy:req.userId},workerId:{not:null}}});if(!job)return res.status(404).json({error:'Active job not found'});const map:any={'focus-payment':'FOCUS_PAYMENT_PAGE','mark-payment-completed':'MARK_PAYMENT_COMPLETED','mark-payment-failed':'MARK_PAYMENT_FAILED','cleanup-session':'CLEANUP_JOB_SESSION'};if(type.data==='focus-payment'&&job.state!=='PAYMENT_READY')return res.status(409).json({error:'Payment page is not ready'});const existing=await prisma.workerCommand.findFirst({where:{jobId:job.id,commandType:map[type.data],status:{in:['PENDING','CLAIMED']}}});if(existing)return res.json({id:existing.id,status:existing.status});const command=await prisma.workerCommand.create({data:{jobId:job.id,workerId:job.workerId!,commandType:map[type.data],expiresAt:new Date(Date.now()+5*60_000)}});res.status(202).json({id:command.id,status:command.status})})
+async function enqueueWorkerCommand(jobId: string, workerId: string, commandType: 'PAUSE_JOB' | 'RESUME_JOB' | 'FOCUS_PAYMENT_PAGE' | 'MARK_PAYMENT_COMPLETED' | 'MARK_PAYMENT_FAILED' | 'CLEANUP_JOB_SESSION') {
+  const existing = await prisma.workerCommand.findFirst({ where: { jobId, commandType, status: { in: ['PENDING', 'CLAIMED'] } } })
+  if (existing) return existing
+  return prisma.workerCommand.create({ data: { jobId, workerId, commandType, expiresAt: new Date(Date.now() + 5 * 60_000) } })
+}
+router.post('/jobs/:id/pause', async (req: AuthRequest, res) => {
+  const job = await prisma.automationJob.findFirst({ where: { id: req.params.id, application: { createdBy: req.userId }, workerId: { not: null }, state: { in: ['WAITING_FOR_OTP', 'WAITING_FOR_SLOT', 'VERIFICATION_REQUIRED'] } } })
+  if (!job?.workerId) return res.status(409).json({ error: 'Job is not at a safe pause point' })
+  await prisma.$transaction([prisma.automationJob.update({ where: { id: job.id }, data: { state: 'PAUSED', pausedAt: new Date() } }), prisma.automationJobEvent.create({ data: { jobId: job.id, state: 'PAUSED', message: 'Operator requested pause at a safe recovery point' } })])
+  const command = await enqueueWorkerCommand(job.id, job.workerId, 'PAUSE_JOB')
+  res.status(202).json({ id: command.id, status: command.status })
+})
+router.post('/jobs/:id/resume', async (req: AuthRequest, res) => {
+  const job = await prisma.automationJob.findFirst({ where: { id: req.params.id, application: { createdBy: req.userId }, workerId: { not: null }, state: { in: ['VERIFICATION_REQUIRED', 'WAITING_FOR_SLOT', 'PAUSED'] } } })
+  if (!job?.workerId) return res.status(409).json({ error: 'Job is not at a safe recovery point' })
+  await prisma.$transaction([prisma.automationJob.update({ where: { id: job.id }, data: { state: 'RETRYING', pausedAt: null } }), prisma.automationJobEvent.create({ data: { jobId: job.id, state: 'RETRYING', message: 'Operator requested resume from retained-session recovery point' } })])
+  const command = await enqueueWorkerCommand(job.id, job.workerId, 'RESUME_JOB')
+  res.status(202).json({ id: command.id, status: command.status })
+})
+router.post('/jobs/:id/cancel', async (req: AuthRequest, res) => {
+  const job = await prisma.automationJob.findFirst({ where: { id: req.params.id, application: { createdBy: req.userId }, state: { notIn: ['COMPLETED', 'FAILED', 'CANCELLED'] } } })
+  if (!job) return res.status(409).json({ error: 'Job cannot be cancelled' })
+  await prisma.$transaction([prisma.automationJob.update({ where: { id: job.id }, data: { state: 'CANCELLED' } }), prisma.automationJobEvent.create({ data: { jobId: job.id, state: 'CANCELLED', message: 'Operator cancelled automation job' } })])
+  const command = job.workerId ? await enqueueWorkerCommand(job.id, job.workerId, 'CLEANUP_JOB_SESSION') : null
+  res.status(202).json({ id: command?.id ?? null, status: command?.status ?? 'COMPLETED' })
+})
+router.post('/jobs/:id/commands/:commandType', async (req: AuthRequest, res) => {
+  const type = z.enum(['focus-payment', 'mark-payment-completed', 'mark-payment-failed', 'cleanup-session']).safeParse(req.params.commandType)
+  if (!type.success) return res.status(422).json({ error: 'Unsupported command' })
+  const job = await prisma.automationJob.findFirst({ where: { id: req.params.id, application: { createdBy: req.userId }, workerId: { not: null } } })
+  if (!job?.workerId) return res.status(404).json({ error: 'Active job not found' })
+  const map = { 'focus-payment': 'FOCUS_PAYMENT_PAGE', 'mark-payment-completed': 'MARK_PAYMENT_COMPLETED', 'mark-payment-failed': 'MARK_PAYMENT_FAILED', 'cleanup-session': 'CLEANUP_JOB_SESSION' } as const
+  if (type.data === 'focus-payment' && job.state !== 'PAYMENT_READY') return res.status(409).json({ error: 'Payment page is not ready' })
+  if (type.data === 'cleanup-session' && !['PAUSED', 'CANCELLED', 'COMPLETED', 'FAILED', 'NEEDS_ATTENTION'].includes(job.state)) return res.status(409).json({ error: 'Session cleanup is not safe while this job is active' })
+  const command = await enqueueWorkerCommand(job.id, job.workerId, map[type.data])
+  res.status(202).json({ id: command.id, status: command.status })
+})
 router.get('/jobs/:jobId/commands/:commandId',async(req:AuthRequest,res)=>{const command=await prisma.workerCommand.findFirst({where:{id:req.params.commandId,jobId:req.params.jobId,job:{application:{createdBy:req.userId}}},select:{id:true,status:true,errorCode:true,commandType:true,completedAt:true}});if(!command)return res.status(404).json({error:'Command not found'});res.json(command)})
 const provisionSchema = z.object({ deviceName: z.string().trim().min(2), deviceIdentifier: z.string().trim().min(8), phoneNumber: z.string().trim().min(6) })
 const pairingCreateSchema = z.object({ deviceName: z.string().trim().min(2).max(191), phoneNumber: z.string().trim().min(6).max(30), backendUrl: z.string().url().max(2048).refine(value => ['http:', 'https:'].includes(new URL(value).protocol), 'Backend URL must use HTTP or HTTPS') })
 const pairingExchangeSchema = z.object({ pairingCode: z.string().trim().min(12).max(64) })
+const deviceRegistrationSchema = z.object({ deviceName: z.string().trim().min(2).max(191), deviceIdentifier: z.string().trim().min(8).max(191), phoneNumber: z.string().trim().min(6).max(30), registrationSecret: z.string().trim().min(32).max(191) })
 const pairingTtlMs = 10 * 60_000
 const heartbeatSchema = z.object({ deviceIdentifier: z.string().trim().min(8) })
 const smsSchema = z.object({ messageUid: z.string().trim().min(8).max(191), receiverNumber: z.string().trim().min(6), senderNumber: z.string().trim().min(1), message: z.string().min(1).max(5000), receivedAt: z.coerce.date(), deviceIdentifier: z.string().trim().min(8) })
 function collectorKey(req: any) { return req.header('x-collector-key') || '' }
+function registrationKey(req: any) { return req.header('x-registration-secret') || '' }
 const pairingHash = (code: string) => createHash('sha256').update(code).digest('hex')
 const collectorDto = (collector: { id: string; deviceName: string; deviceIdentifier: string; phoneNumber: string; status: string }) => ({ id: collector.id, deviceName: collector.deviceName, deviceIdentifier: collector.deviceIdentifier, phoneNumber: collector.phoneNumber, status: collector.status })
 async function createPairing(collectorId: string, apiKey: string, backendUrl: string) {
@@ -71,6 +211,40 @@ async function createPairing(collectorId: string, apiKey: string, backendUrl: st
   return { pairingCode: code, expiresAt }
 }
 router.post('/collectors/register', async (req: AuthRequest, res) => { const input = provisionSchema.safeParse(req.body); if (!input.success) return res.status(422).json({ error: 'Validation failed', fields: input.error.flatten() }); const created = await provisionCollector(input.data); res.status(201).json({ collector: { id: created.collector.id, deviceName: created.collector.deviceName, deviceIdentifier: created.collector.deviceIdentifier, phoneNumber: created.collector.phoneNumber, status: created.collector.status }, apiKey: created.apiKey }) })
+router.post('/collectors/device-registrations', async (req, res) => {
+  const input = deviceRegistrationSchema.safeParse(req.body)
+  if (!input.success) return res.status(422).json({ error: 'Validation failed', fields: input.error.flatten() })
+  try {
+    const collector = await requestDeviceRegistration(input.data)
+    res.status(202).json({ registrationStatus: 'PENDING_APPROVAL', collector: collectorDto(collector) })
+  } catch (error) {
+    const code = error instanceof Error ? error.message : 'REGISTRATION_FAILED'
+    res.status(code === 'INVALID_BANGLADESH_PHONE' ? 422 : code === 'DEVICE_ALREADY_REGISTERED' ? 409 : 400).json({ error: code })
+  }
+})
+router.get('/collectors/device-registrations/:deviceIdentifier', async (req, res) => {
+  try {
+    const collector = await authenticateRegistration(req.params.deviceIdentifier, registrationKey(req))
+    if (!collector.registrationApprovedAt) return res.status(202).json({ registrationStatus: 'PENDING_APPROVAL' })
+    if (!collector.encryptedRegistrationKey || collector.credentialDeliveredAt) return res.status(410).json({ error: 'CREDENTIAL_UNAVAILABLE_RE_REGISTER' })
+    const deliveredAt = new Date()
+    const updated = await prisma.smsCollector.update({ where: { id: collector.id }, data: { credentialDeliveredAt: deliveredAt, encryptedRegistrationKey: null, registrationSecretHash: null } })
+    await prisma.collectorEvent.create({ data: { collectorId: collector.id, type: 'CREDENTIAL_DELIVERED', message: 'Approved credential delivered to registered device' } })
+    res.json({ registrationStatus: 'CONNECTED', collector: collectorDto(updated), apiKey: decryptSecret(collector.encryptedRegistrationKey) })
+  } catch (error) {
+    const code = error instanceof Error ? error.message : 'REGISTRATION_FAILED'
+    res.status((error as any)?.status ?? 400).json({ error: code })
+  }
+})
+router.post('/collectors/:id/approve-registration', async (req: AuthRequest, res) => {
+  const collector = await prisma.smsCollector.findUnique({ where: { id: req.params.id } })
+  if (!collector) return res.status(404).json({ error: 'Collector not found' })
+  if (collector.registrationApprovedAt || !collector.registrationSecretHash) return res.status(409).json({ error: 'Collector is not awaiting approval' })
+  const apiKey = randomBytes(32).toString('base64url')
+  const updated = await prisma.smsCollector.update({ where: { id: collector.id }, data: { apiKeyHash: await bcrypt.hash(apiKey, 12), encryptedRegistrationKey: encryptSecret(apiKey), registrationApprovedAt: new Date(), credentialDeliveredAt: null, status: 'OFFLINE' } })
+  await prisma.collectorEvent.create({ data: { collectorId: collector.id, type: 'REGISTRATION_APPROVED', message: 'Collector registration approved by operator' } })
+  res.json({ collector: collectorDto(updated) })
+})
 router.post('/collectors/pairings', async (req: AuthRequest, res) => {
   const input = pairingCreateSchema.safeParse(req.body)
   if (!input.success) return res.status(422).json({ error: 'Validation failed', fields: input.error.flatten() })
@@ -106,8 +280,23 @@ router.post('/collectors/pair', async (req, res) => {
 })
 router.post('/collectors/heartbeat', async (req, res) => { const input = heartbeatSchema.safeParse(req.body); if (!input.success) return res.status(422).json({ error: 'Validation failed' }); const collector = await authenticateCollector(input.data.deviceIdentifier, collectorKey(req)); const now = new Date(); await prisma.smsCollector.update({ where: { id: collector.id }, data: { status: 'ONLINE', lastHeartbeatAt: now } }); await prisma.collectorEvent.create({ data: { collectorId: collector.id, type: 'HEARTBEAT', message: 'Heartbeat received' } }); res.json({ status: 'ONLINE', serverTime: now.toISOString() }) })
 router.get('/collectors/:id/status', async (req: AuthRequest, res) => { const collector = await prisma.smsCollector.findUnique({ where: { id: req.params.id }, select: { id: true, deviceName: true, phoneNumber: true, status: true, lastHeartbeatAt: true, updatedAt: true } }); if (!collector) return res.status(404).json({ error: 'Collector not found' }); const age = collector.lastHeartbeatAt ? Date.now() - collector.lastHeartbeatAt.getTime() : Infinity; const status = collector.status === 'DISABLED' ? 'DISABLED' : age < 2 * 60_000 ? 'ONLINE' : age < 10 * 60_000 ? 'DEGRADED' : 'OFFLINE'; res.json({ ...collector, status }) })
-router.get('/collectors', async (_req: AuthRequest, res) => { const collectors = await prisma.smsCollector.findMany({ select: { id: true, deviceName: true, deviceIdentifier: true, phoneNumber: true, status: true, lastHeartbeatAt: true, messages: { select: { receivedAt: true }, orderBy: { receivedAt: 'desc' }, take: 1 } }, orderBy: { updatedAt: 'desc' } }); res.json({ data: collectors.map(c => ({ id: c.id, deviceName: c.deviceName, phoneNumber: c.phoneNumber, status: c.status === 'DISABLED' ? 'DISABLED' : !c.lastHeartbeatAt || Date.now() - c.lastHeartbeatAt.getTime() >= 10 * 60_000 ? 'OFFLINE' : Date.now() - c.lastHeartbeatAt.getTime() >= 2 * 60_000 ? 'DEGRADED' : 'ONLINE', lastHeartbeatAt: c.lastHeartbeatAt, lastSmsReceivedAt: c.messages[0]?.receivedAt ?? null })) }) })
+router.get('/collectors', async (_req: AuthRequest, res) => {
+  const [collectors, applications] = await Promise.all([
+    prisma.smsCollector.findMany({ select: { id: true, deviceName: true, deviceIdentifier: true, phoneNumber: true, status: true, registrationApprovedAt: true, credentialDeliveredAt: true, lastHeartbeatAt: true, messages: { select: { receivedAt: true }, orderBy: { receivedAt: 'desc' }, take: 1 } }, orderBy: { updatedAt: 'desc' } }),
+    prisma.application.findMany({ where: { status: 'ACTIVE' }, select: { id: true, fullName: true, webfileNumber: true, otpReceiverPhone: true, credentials: { select: { loginPhone: true } }, automationJobs: { where: { state: 'WAITING_FOR_OTP' }, select: { id: true } } } }),
+  ])
+  res.json({ data: collectors.map(collector => {
+    const matchingApplications = applications.filter(application => normalizeBangladeshPhone(application.otpReceiverPhone) === collector.phoneNumber || normalizeBangladeshPhone(application.credentials?.loginPhone ?? '') === collector.phoneNumber)
+    const matchingApplicationCount = matchingApplications.length
+    const waitingOtpJobCount = matchingApplications.reduce((count, application) => count + application.automationJobs.length, 0)
+    const matchedApplication = matchingApplications.length === 1 ? { id: matchingApplications[0].id, fullName: matchingApplications[0].fullName, webfileNumber: matchingApplications[0].webfileNumber } : null
+    const matchedJob = waitingOtpJobCount === 1 ? { id: matchingApplications.flatMap(application => application.automationJobs)[0].id, state: 'WAITING_FOR_OTP' } : null
+    const status = collector.status === 'DISABLED' ? 'DISABLED' : !collector.registrationApprovedAt ? 'PENDING' : !collector.lastHeartbeatAt || Date.now() - collector.lastHeartbeatAt.getTime() >= 10 * 60_000 ? 'OFFLINE' : Date.now() - collector.lastHeartbeatAt.getTime() >= 2 * 60_000 ? 'DEGRADED' : 'ONLINE'
+    return { id: collector.id, deviceName: collector.deviceName, phoneNumber: collector.phoneNumber, status, registrationStatus: !collector.registrationApprovedAt ? 'PENDING_APPROVAL' : !collector.credentialDeliveredAt ? 'CREDENTIAL_READY' : 'CONNECTED', matchingApplicationCount, waitingOtpJobCount, matchedApplication, matchedJob, lastHeartbeatAt: collector.lastHeartbeatAt, lastSmsReceivedAt: collector.messages[0]?.receivedAt ?? null }
+  }) })
+})
 router.patch('/collectors/:id/status', async (req: AuthRequest, res) => { const input = z.object({ action: z.enum(['disable', 'enable']) }).safeParse(req.body); if (!input.success) return res.status(422).json({ error: 'Validation failed' }); const collector = await prisma.smsCollector.findUnique({ where: { id: req.params.id } }); if (!collector) return res.status(404).json({ error: 'Collector not found' }); const status = input.data.action === 'disable' ? 'DISABLED' : 'OFFLINE'; const updated = await prisma.smsCollector.update({ where: { id: collector.id }, data: { status } }); await prisma.collectorEvent.create({ data: { collectorId: collector.id, type: input.data.action === 'disable' ? 'DISABLED' : 'RE_ENABLED', message: input.data.action === 'disable' ? 'Collector disabled by operator' : 'Collector re-enabled by operator' } }); res.json({ collector: collectorDto(updated) }) })
+router.delete('/collectors/:id', async (req: AuthRequest, res) => { const collector = await prisma.smsCollector.findUnique({ where: { id: req.params.id } }); if (!collector) return res.status(404).json({ error: 'Collector not found' }); await prisma.smsCollector.update({ where: { id: collector.id }, data: { status: 'DISABLED', apiKeyHash: await bcrypt.hash(randomBytes(32).toString('base64url'), 12), registrationSecretHash: null, encryptedRegistrationKey: null, credentialDeliveredAt: new Date() } }); await prisma.collectorEvent.create({ data: { collectorId: collector.id, type: 'REVOKED', message: 'Collector credential revoked by operator' } }); res.status(204).end() })
 router.post('/sms', async (req, res) => { const input = smsSchema.safeParse(req.body); if (!input.success) return res.status(422).json({ error: 'Validation failed', fields: input.error.flatten() }); const collector = await authenticateCollector(input.data.deviceIdentifier, collectorKey(req)); try { const sms = await matchIncomingSms(collector.id, input.data); res.status(201).json({ id: sms.id, status: sms.status }) } catch (error) { if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return res.status(409).json({ error: 'Duplicate message UID', status: 'DUPLICATE' }); throw error } })
 router.get('/sms', async (_req: AuthRequest, res) => {
   const query = z.object({ status: z.enum(['NEW','MATCHED','UNMATCHED','PROCESSED','IGNORED','DUPLICATE','NEEDS_REVIEW','EXPIRED']).optional(), collectorId: z.string().optional(), receiver: z.string().optional(), date: z.string().date().optional() }).parse(_req.query)
@@ -188,7 +377,44 @@ router.put('/applications/:id', async (req: AuthRequest, res) => {
 
 router.delete('/applications/:id', async (req: AuthRequest, res) => { await assertApplicationAccess(req.params.id, req.userId); await prisma.application.update({ where: { id: req.params.id }, data: { status: 'ARCHIVED' } }); await event(req.params.id, req.userId, 'APPLICATION_ARCHIVED', 'Application archived'); res.status(204).end() })
 
-router.post('/applications/:id/document', upload.single('document'), async (req: AuthRequest, res) => { await assertApplicationAccess(req.params.id, req.userId); if (!req.file) return res.status(422).json({ error: `A PDF file up to ${env.DOCUMENT_MAX_SIZE_MB}MB is required` }); const stored = await writePrivatePdf(req.file); try { const old = await prisma.applicationDocument.findUnique({ where: { applicationId_kind: { applicationId: req.params.id, kind: 'BGDR' } } }); const doc = await prisma.applicationDocument.upsert({ where: { applicationId_kind: { applicationId: req.params.id, kind: 'BGDR' } }, create: { applicationId: req.params.id, originalFilename: req.file.originalname, mimeType: req.file.mimetype, size: req.file.size, storedPath: stored.storedPath, uploadedBy: req.userId }, update: { originalFilename: req.file.originalname, mimeType: req.file.mimetype, size: req.file.size, storedPath: stored.storedPath, uploadedBy: req.userId, uploadedAt: new Date() } }); if (old) await rm(old.storedPath, { force: true }); await event(req.params.id, req.userId, old ? 'DOCUMENT_REPLACED' : 'DOCUMENT_UPLOADED', old ? 'BGDR document replaced' : 'BGDR document uploaded'); res.status(201).json(doc) } catch (e) { await stored.cleanup(); throw e } })
-router.get('/applications/:id/document', async (req: AuthRequest, res) => { await assertApplicationAccess(req.params.id, req.userId); const doc = await prisma.applicationDocument.findUnique({ where: { applicationId_kind: { applicationId: req.params.id, kind: 'BGDR' } } }); if (!doc) return res.status(404).json({ error: 'Document not found' }); res.setHeader('Content-Type', 'application/pdf'); res.setHeader('Content-Disposition', `${req.query.download === '1' ? 'attachment' : 'inline'}; filename="${doc.originalFilename.replace(/[\r\n"]/g, '')}"`); createReadStream(doc.storedPath).on('error', () => res.status(404).end()).pipe(res) })
-router.delete('/applications/:id/document', async (req: AuthRequest, res) => { await assertApplicationAccess(req.params.id, req.userId); const doc = await prisma.applicationDocument.findUnique({ where: { applicationId_kind: { applicationId: req.params.id, kind: 'BGDR' } } }); if (!doc) return res.status(404).json({ error: 'Document not found' }); await prisma.applicationDocument.delete({ where: { id: doc.id } }); await rm(doc.storedPath, { force: true }); await event(req.params.id, req.userId, 'DOCUMENT_DELETED', 'BGDR document deleted'); res.status(204).end() })
+const documentSlot = (value: unknown) => z.coerce.number().int().min(1).max(4).safeParse(value ?? 1)
+router.post('/applications/:id/document', upload.single('document'), async (req: AuthRequest, res) => {
+  await assertApplicationAccess(req.params.id, req.userId)
+  const slot = documentSlot(req.body.slot)
+  if (!slot.success) return res.status(422).json({ error: 'Document slot must be between 1 and 4' })
+  if (!req.file) return res.status(422).json({ error: `A PDF file up to ${env.DOCUMENT_MAX_SIZE_MB}MB is required` })
+  const stored = await writePrivatePdf(req.file)
+  try {
+    const old = await prisma.applicationDocument.findUnique({ where: { applicationId_slot: { applicationId: req.params.id, slot: slot.data } } })
+    const doc = await prisma.applicationDocument.upsert({
+      where: { applicationId_slot: { applicationId: req.params.id, slot: slot.data } },
+      create: { applicationId: req.params.id, kind: 'BGDR', slot: slot.data, originalFilename: req.file.originalname, mimeType: req.file.mimetype, size: req.file.size, storedPath: stored.storedPath, uploadedBy: req.userId },
+      update: { originalFilename: req.file.originalname, mimeType: req.file.mimetype, size: req.file.size, storedPath: stored.storedPath, uploadedBy: req.userId, uploadedAt: new Date() },
+    })
+    if (old) await rm(old.storedPath, { force: true })
+    await event(req.params.id, req.userId, old ? 'DOCUMENT_REPLACED' : 'DOCUMENT_UPLOADED', old ? `BGDR file ${slot.data} replaced` : `BGDR file ${slot.data} uploaded`)
+    res.status(201).json(doc)
+  } catch (error) { await stored.cleanup(); throw error }
+})
+router.get('/applications/:id/document', async (req: AuthRequest, res) => {
+  await assertApplicationAccess(req.params.id, req.userId)
+  const slot = documentSlot(req.query.slot)
+  if (!slot.success) return res.status(422).json({ error: 'Document slot must be between 1 and 4' })
+  const doc = await prisma.applicationDocument.findUnique({ where: { applicationId_slot: { applicationId: req.params.id, slot: slot.data } } })
+  if (!doc) return res.status(404).json({ error: 'Document not found' })
+  res.setHeader('Content-Type', 'application/pdf')
+  res.setHeader('Content-Disposition', `${req.query.download === '1' ? 'attachment' : 'inline'}; filename="${doc.originalFilename.replace(/[\r\n"]/g, '')}"`)
+  createReadStream(doc.storedPath).on('error', () => res.status(404).end()).pipe(res)
+})
+router.delete('/applications/:id/document', async (req: AuthRequest, res) => {
+  await assertApplicationAccess(req.params.id, req.userId)
+  const slot = documentSlot(req.query.slot)
+  if (!slot.success) return res.status(422).json({ error: 'Document slot must be between 1 and 4' })
+  const doc = await prisma.applicationDocument.findUnique({ where: { applicationId_slot: { applicationId: req.params.id, slot: slot.data } } })
+  if (!doc) return res.status(404).json({ error: 'Document not found' })
+  await prisma.applicationDocument.delete({ where: { id: doc.id } })
+  await rm(doc.storedPath, { force: true })
+  await event(req.params.id, req.userId, 'DOCUMENT_DELETED', `BGDR file ${slot.data} deleted`)
+  res.status(204).end()
+})
 export { router }
