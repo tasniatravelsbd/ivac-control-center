@@ -210,7 +210,7 @@ async function createPairing(collectorId: string, apiKey: string, backendUrl: st
   await prisma.collectorPairing.create({ data: { collectorId, codeHash: pairingHash(code), encryptedCollectorKey: encryptSecret(apiKey), backendUrl: backendUrl.trim().replace(/\/$/, ''), expiresAt } })
   return { pairingCode: code, expiresAt }
 }
-router.post('/collectors/register', async (req: AuthRequest, res) => { const input = provisionSchema.safeParse(req.body); if (!input.success) return res.status(422).json({ error: 'Validation failed', fields: input.error.flatten() }); const created = await provisionCollector(input.data); res.status(201).json({ collector: { id: created.collector.id, deviceName: created.collector.deviceName, deviceIdentifier: created.collector.deviceIdentifier, phoneNumber: created.collector.phoneNumber, status: created.collector.status }, apiKey: created.apiKey }) })
+router.post('/collectors/register', async (req, res) => { const input = provisionSchema.safeParse(req.body); if (!input.success) return res.status(422).json({ error: 'Validation failed', fields: input.error.flatten() }); try { const created = await provisionCollector(input.data); res.status(201).json({ collector: collectorDto(created.collector), apiKey: created.apiKey }) } catch (error) { const code = error instanceof Error ? error.message : 'REGISTRATION_FAILED'; res.status(code === 'INVALID_BANGLADESH_PHONE' ? 422 : 400).json({ error: code }) } })
 router.post('/collectors/device-registrations', async (req, res) => {
   const input = deviceRegistrationSchema.safeParse(req.body)
   if (!input.success) return res.status(422).json({ error: 'Validation failed', fields: input.error.flatten() })

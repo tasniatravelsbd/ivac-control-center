@@ -4,7 +4,7 @@ import { createRoot } from 'react-dom/client'
 import {
   Activity, ArrowRight, Bell, CalendarDays, Check, ChevronLeft, ChevronRight, CircleHelp,
   Clock3, Command, FileText, LayoutDashboard, Menu, MoreHorizontal, Moon, Plus, Radio,
-  Search, Settings, ShieldAlert, Sun, Upload, Users, X, Zap
+  Search, Settings, ShieldAlert, Sun, Upload, Download, Users, X, Zap
 } from 'lucide-react'
 import './styles.css'
 import { api, OPERATOR_SESSION_EXPIRED_EVENT, OPERATOR_SESSION_KEY, type Application, type AutomationJob } from './api'
@@ -47,7 +47,7 @@ function App() {
   }, [])
   if (!authenticated) return <OperatorLogin message={sessionMessage} onAuthenticated={() => { setSessionMessage(''); setAuthenticated(true) }}/>
   return <div className="operations-app">
-    <header className="operations-topbar"><div className="brand"><span className="brand-mark"><span /></span><span className="brand-name">IVAC <b>Control</b></span></div><div className="operations-topbar-copy"><b>Operations Center</b><span>Authenticated operator session</span></div><button className="theme-toggle" onClick={() => setTheme(theme === 'light' ? 'dark' : theme === 'dark' ? 'system' : 'light')} title={`Theme: ${theme}`}>{theme === 'dark' ? <Moon size={17}/> : theme === 'light' ? <Sun size={17}/> : <CircleHelp size={17}/>}</button><Avatar initials="OP"/></header>
+    <header className="operations-topbar"><div className="operations-brand"><span className="brand-mark"><span /></span><span className="brand-name">IVAC <b>Control</b></span></div><div className="operations-topbar-copy"><b>Operations Center</b></div><div className="operations-topbar-actions"><span>Authenticated operator session</span><button className="theme-toggle" onClick={() => setTheme(theme === 'light' ? 'dark' : theme === 'dark' ? 'system' : 'light')} title={`Theme: ${theme}`}>{theme === 'dark' ? <Moon size={17}/> : theme === 'light' ? <Sun size={17}/> : <CircleHelp size={17}/>}</button><Avatar initials="OP"/></div></header>
     <main className="page-wrap"><OperationsCenter/></main>
   </div>
 }
@@ -150,7 +150,7 @@ function OperationsTable({ applications, jobs, collectors, selectedId, onSelect,
     const hasBgdr = application.documents.some(document => document.slot === 1 && document.mimeType === 'application/pdf')
     const canPause = !!job && ['WAITING_FOR_OTP', 'WAITING_FOR_SLOT', 'VERIFICATION_REQUIRED'].includes(job.state)
     const canResume = !!job && ['PAUSED', 'VERIFICATION_REQUIRED', 'WAITING_FOR_SLOT'].includes(job.state)
-    return <tr className={selectedId === application.id ? 'selected-row' : ''} key={application.id} onClick={() => onSelect(application.id)}><td><div className="table-person"><Avatar initials={application.fullName.split(' ').map(part => part[0]).slice(0, 2).join('')}/><span><b>{application.fullName}</b><small>{application.webfileNumber || 'No webfile'}</small></span></div></td><td>{application.primaryPhone}</td><td><Badge tone={hasBgdr ? 'mint' : 'amber'}>{hasBgdr ? 'READY' : 'MISSING'}</Badge></td><td><Badge tone={collector?.status === 'ONLINE' ? 'mint' : collector ? 'amber' : 'slate'}>{collector?.status ?? 'NOT PAIRED'}</Badge></td><td><Badge tone={job ? jobTone(job.state) : 'slate'}>{job?.state ?? 'NO JOB'}</Badge></td><td>{new Date(job?.updatedAt ?? application.updatedAt).toLocaleString()}</td><td onClick={event => event.stopPropagation()}><div className="row-actions">{!job && <button className="primary" onClick={() => void onAction(application, 'start')}>START</button>}<button className="quiet" onClick={() => onSelect(application.id)}>VIEW</button>{canPause && <button className="quiet" onClick={() => void onAction(application, 'pause')}>PAUSE</button>}{canResume && <button className="quiet" onClick={() => void onAction(application, 'resume')}>RETRY</button>}{job && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(job.state) && <button className="quiet danger" onClick={() => void onAction(application, 'cancel')}>CANCEL</button>}{job?.state === 'PAYMENT_READY' && <OpenPaymentButton job={job} onComplete={() => void onReload()}/>}</div></td></tr>
+    return <tr className={selectedId === application.id ? 'selected-row' : ''} key={application.id} onClick={() => onSelect(application.id)}><td><div className="table-person"><Avatar initials={application.fullName.split(' ').map(part => part[0]).slice(0, 2).join('')}/><span><b>{application.fullName}</b><small>{application.webfileNumber || 'No webfile'}</small></span></div></td><td>{application.primaryPhone}</td><td><Badge tone={hasBgdr ? 'mint' : 'amber'}>{hasBgdr ? 'READY' : 'MISSING'}</Badge></td><td><Badge tone={collector?.status === 'ONLINE' ? 'mint' : collector ? 'amber' : 'rose'}>{collector?.status === 'ONLINE' ? 'CONNECTED' : collector ? 'OFFLINE' : 'NOT CONNECTED'}</Badge>{collector && <small>{collector.deviceName}</small>}</td><td><Badge tone={job ? jobTone(job.state) : 'slate'}>{job?.state ?? 'NO JOB'}</Badge></td><td>{new Date(job?.updatedAt ?? application.updatedAt).toLocaleString()}</td><td onClick={event => event.stopPropagation()}><div className="row-actions">{!job && <button className="primary" onClick={() => void onAction(application, 'start')}>START</button>}<button className="quiet" onClick={() => onSelect(application.id)}>VIEW</button>{canPause && <button className="quiet" onClick={() => void onAction(application, 'pause')}>PAUSE</button>}{canResume && <button className="quiet" onClick={() => void onAction(application, 'resume')}>RETRY</button>}{job && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(job.state) && <button className="quiet danger" onClick={() => void onAction(application, 'cancel')}>CANCEL</button>}{job?.state === 'PAYMENT_READY' && <OpenPaymentButton job={job} onComplete={() => void onReload()}/>}</div></td></tr>
   })}</tbody></table>{applications.length === 0 && <p className="muted operations-empty">No applications yet. Add an application to begin local operations.</p>}</div>
 }
 
@@ -165,14 +165,67 @@ function LiveJobDetail({ application, job, onReload }: { application: Applicatio
   return <section className="live-job-detail"><div className="section-label"><span>LIVE JOB DETAIL</span><b>{application.fullName}</b>{job && <Badge tone={jobTone(job.state)}>{job.state}</Badge>}</div><Card><div className="stage-strip">{stages.map((stage, index) => <div key={stage} className={job ? (job.lastSuccessfulStage === stage || job.currentStage.includes(stage) || (terminal && stage === 'PAYMENT') ? 'active' : '') : ''}><span>{index + 1}</span><b>{stage}</b><small>{job?.currentStage.includes(stage) ? job.currentStage : job?.lastSuccessfulStage === stage ? 'Complete' : 'Waiting'}</small></div>)}</div><div className="live-detail-grid"><div><h2>Current status</h2>{job ? <dl><div><dt>Worker</dt><dd>{job.worker?.workerName ?? 'Waiting for worker'}</dd></div><div><dt>OTP</dt><dd>{job.otpStatus}</dd></div><div><dt>Slot</dt><dd>{job.slotStatus}</dd></div><div><dt>Payment</dt><dd>{job.paymentStatus}</dd></div><div><dt>Last safe error</dt><dd>{job.latestSafeError ?? '—'}</dd></div></dl> : <p className="muted">No automation job has been created for this application.</p>}{job?.state === 'PAYMENT_READY' && <OpenPaymentButton job={job} onComplete={() => void onReload()}/>}</div><div><h2>Event timeline</h2>{timeline.length ? <div className="timeline">{timeline.slice(-8).reverse().map((event, index) => <Timeline key={`${event.timestamp}:${event.event}`} title={event.event} text={event.state} time={new Date(event.timestamp).toLocaleString()} tone={index === 0 ? 'violet' : 'slate'}/>)}</div> : <p className="muted">No job events yet.</p>}</div></div></Card></section>
 }
 
-function Modal({ title, onClose, children, className = '' }: { title: string; onClose: () => void; children: React.ReactNode; className?: string }) { return <div className="ops-overlay" role="dialog" aria-modal="true" aria-label={title}><div className={`ops-modal ${className}`}><div className="ops-modal-head"><h2>{title}</h2><button className="icon-button" onClick={onClose} aria-label="Close"><X size={18}/></button></div>{children}</div></div> }
+function Modal({ title, onClose, children, className = '' }: { title: string; onClose: () => void; children: React.ReactNode; className?: string }) { return <div className="ops-overlay ops-modal-overlay" role="dialog" aria-modal="true" aria-label={title}><div className={`ops-modal ${className}`}><div className="ops-modal-head"><h2>{title}</h2><button className="icon-button" onClick={onClose} aria-label="Close"><X size={18}/></button></div>{children}</div></div> }
 
 function CollectorDrawer({ collectors, onClose, onReload }: { collectors: import('./api').Collector[]; onClose: () => void; onReload: () => Promise<void> }) {
+  const [deviceName, setDeviceName] = useState('')
+  const [phoneNumber, setPhoneNumber] = useState('')
+  const [backendUrl, setBackendUrl] = useState('')
+  const [pairing, setPairing] = useState<import('./api').CollectorPairing | null>(null)
+  const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
-  const approve = async (collector: import('./api').Collector) => { try { await api.approveCollectorRegistration(collector.id); await onReload() } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to approve device') } }
-  const status = async (collector: import('./api').Collector) => { try { await api.setCollectorStatus(collector.id, collector.status === 'DISABLED' ? 'enable' : 'disable'); await onReload() } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to change collector status') } }
-  const revoke = async (collector: import('./api').Collector) => { if (!window.confirm(`Revoke ${collector.deviceName}?`)) return; try { await api.revokeCollector(collector.id); await onReload() } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to revoke collector') } }
-  return <div className="ops-overlay"><aside className="collector-drawer"><div className="ops-modal-head"><div><p className="eyebrow">SMS COLLECTORS</p><h2>Connected devices</h2></div><button className="icon-button" onClick={onClose}><X size={18}/></button></div><p className="muted">Collector keys and SMS contents are never shown here.</p>{error && <p className="safety-note">{error}</p>}{collectors.length === 0 ? <p className="muted">No collectors registered. Connect an Android device to request secure registration.</p> : collectors.map(collector => <div className="collector-row" key={collector.id}><div><b>{collector.deviceName}</b><small>{collector.phoneNumber}</small><small>Last heartbeat: {collector.lastHeartbeatAt ? new Date(collector.lastHeartbeatAt).toLocaleString() : 'never'}</small><small>{collector.matchingApplicationCount > 1 ? 'Multiple active applications: OTP matching remains ambiguous' : collector.matchedApplication ? `Matched applicant: ${collector.matchedApplication.fullName} · ${collector.matchedApplication.webfileNumber}` : 'No matching active application'}</small>{collector.matchedJob && <small>Waiting job: {collector.matchedJob.id.slice(-8)} · {collector.matchedJob.state}</small>}</div><Badge tone={collector.status === 'ONLINE' ? 'mint' : collector.status === 'PENDING' ? 'amber' : 'slate'}>{collector.status}</Badge><div>{collector.registrationStatus === 'PENDING_APPROVAL' && <button className="primary" onClick={() => void approve(collector)}>Approve device</button>}<button className="quiet" onClick={() => void status(collector)}>{collector.status === 'DISABLED' ? 'Re-enable' : 'Disable'}</button><button className="quiet danger" onClick={() => void revoke(collector)}>Revoke / re-register</button></div></div>)}</aside></div>
+
+  useEffect(() => {
+    const timer = window.setInterval(() => { void onReload() }, 5_000)
+    return () => window.clearInterval(timer)
+  }, [onReload])
+
+  const setPairingResult = (result: import('./api').CollectorPairing) => {
+    setPairing(result)
+    setError('')
+  }
+  const generate = async () => {
+    const normalized = normalizedPhone(phoneNumber)
+    if (!deviceName.trim() || !backendUrl.trim() || !/^\+8801\d{9}$/.test(normalized)) {
+      setError('Enter a device name, a reachable backend URL, and a valid Bangladesh SIM number.')
+      return
+    }
+    setBusy('create')
+    try {
+      setPairingResult(await api.createCollectorPairing({ deviceName: deviceName.trim(), phoneNumber: normalized, backendUrl: backendUrl.trim() }))
+      await onReload()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to generate a pairing code')
+    } finally { setBusy('') }
+  }
+  const regenerate = async (collector: import('./api').Collector) => {
+    if (!backendUrl.trim()) { setError('Enter the PC backend URL in Add SMS Collector before generating a new code.'); return }
+    setBusy(`pair:${collector.id}`)
+    try {
+      setPairingResult(await api.regenerateCollectorPairing(collector.id, backendUrl.trim()))
+      await onReload()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Unable to generate a new pairing code')
+    } finally { setBusy('') }
+  }
+  const approve = async (collector: import('./api').Collector) => { try { setBusy(`approve:${collector.id}`); await api.approveCollectorRegistration(collector.id); await onReload() } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to approve device') } finally { setBusy('') } }
+  const status = async (collector: import('./api').Collector) => { try { setBusy(`status:${collector.id}`); await api.setCollectorStatus(collector.id, collector.status === 'DISABLED' ? 'enable' : 'disable'); await onReload() } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to change collector status') } finally { setBusy('') } }
+  const revoke = async (collector: import('./api').Collector) => { if (!window.confirm(`Revoke ${collector.deviceName}?`)) return; try { setBusy(`revoke:${collector.id}`); await api.revokeCollector(collector.id); await onReload() } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to revoke collector') } finally { setBusy('') } }
+  const copy = async (value: string, label: string) => { try { await navigator.clipboard.writeText(value); setError(''); } catch { setError(`Unable to copy ${label}. Select it and copy manually.`) } }
+  const recentCutoff = Date.now() - 24 * 60 * 60 * 1000
+  const recentSms = collectors.filter(item => item.lastSmsReceivedAt && new Date(item.lastSmsReceivedAt).getTime() >= recentCutoff).length
+  const sortedCollectors = [...collectors].sort((a, b) => {
+    const rank = (item: import('./api').Collector) => item.waitingOtpJobCount > 0 ? 0 : item.status === 'ONLINE' ? 1 : item.status === 'DEGRADED' ? 2 : item.status === 'OFFLINE' ? 3 : 4
+    return rank(a) - rank(b) || new Date(b.lastHeartbeatAt ?? 0).getTime() - new Date(a.lastHeartbeatAt ?? 0).getTime()
+  })
+  const tone = (collector: import('./api').Collector) => collector.status === 'ONLINE' ? 'mint' : collector.status === 'DEGRADED' || collector.status === 'PENDING' ? 'amber' : collector.status === 'DISABLED' ? 'slate' : 'rose'
+
+  return <div className="ops-overlay"><aside className="collector-drawer" aria-label="SMS collectors"><div className="ops-modal-head"><div><p className="eyebrow">SMS COLLECTORS</p><h2>Connected devices</h2></div><button className="icon-button" onClick={onClose} aria-label="Close"><X size={18}/></button></div><p className="muted">Collector credentials and SMS contents are never shown here.</p>
+    <section className="collector-apk-card"><div><p className="eyebrow">ANDROID SMS COLLECTOR <span>v0.1.0</span></p><p className="muted">Install the collector app on the Android phone that receives IVAC OTP SMS. In the app, enter the receiving SIM number and tap Connect.</p></div><a className="secondary" href="/downloads/IVAC-SMS-Collector.apk" download><Download size={16}/> Download SMS Collector APK</a><ol><li>Download and install the APK.</li><li>Allow SMS permission.</li><li>Enter the receiving SIM number.</li><li>Tap Connect; the device appears here automatically.</li></ol></section>
+    {error && <p className="safety-note">{error}</p>}
+    <div className="collector-summary"><span><b>{collectors.filter(item => item.status === 'ONLINE').length}</b> ONLINE</span><span><b>{collectors.reduce((total, item) => total + item.waitingOtpJobCount, 0)}</b> WAITING OTP</span><span><b>{recentSms}</b> RECENT SMS</span><span><b>{collectors.filter(item => item.status === 'OFFLINE').length}</b> OFFLINE</span></div>
+    <div className="collector-list-head"><h3>Registered collectors</h3><span>{collectors.length}</span></div>
+    {sortedCollectors.length === 0 ? <p className="muted">No collectors connected. Install the Android app and connect it with the receiving SIM number.</p> : sortedCollectors.map(collector => <article className="collector-row" key={collector.id}><div className="collector-row-head"><div><b>{collector.deviceName}</b><small>{collector.phoneNumber}</small></div><Badge tone={tone(collector)}>{collector.status}</Badge></div><div className="collector-meta"><span>Last heartbeat: {collector.lastHeartbeatAt ? new Date(collector.lastHeartbeatAt).toLocaleString() : 'never'}</span><span>Last SMS: {collector.lastSmsReceivedAt ? new Date(collector.lastSmsReceivedAt).toLocaleString() : 'never'}</span>{collector.waitingOtpJobCount > 0 && <Badge tone="amber">WAITING OTP</Badge>}{collector.lastSmsReceivedAt && new Date(collector.lastSmsReceivedAt).getTime() >= recentCutoff && <Badge tone="mint">SMS RECEIVED</Badge>}<span>{collector.matchingApplicationCount > 1 ? 'Multiple active applications: OTP matching remains ambiguous' : collector.matchedApplication ? `Matched applicant: ${collector.matchedApplication.fullName} · ${collector.matchedApplication.webfileNumber}` : 'No matching active application'}</span>{collector.matchedJob && <span>Waiting job: {collector.matchedJob.id.slice(-8)} · {collector.matchedJob.state}</span>}</div><div className="collector-actions"><button className="quiet" disabled={!!busy} onClick={() => void status(collector)}>{collector.status === 'DISABLED' ? 'Re-enable' : 'Disable'}</button><button className="quiet danger" disabled={!!busy} onClick={() => void revoke(collector)}>{busy === `revoke:${collector.id}` ? 'Revoking…' : 'Revoke / disconnect'}</button></div></article>)}</aside></div>
 }
 
 function SettingsDrawer({ onClose }: { onClose: () => void }) { return <div className="ops-overlay"><aside className="settings-drawer"><div className="ops-modal-head"><div><p className="eyebrow">SETTINGS</p><h2>Operator settings</h2></div><button className="icon-button" onClick={onClose}><X size={18}/></button></div><p className="muted">This panel uses your authenticated session. Automation and payment settings remain server-controlled.</p><button className="secondary" onClick={() => { localStorage.removeItem(OPERATOR_SESSION_KEY); window.dispatchEvent(new Event(OPERATOR_SESSION_EXPIRED_EVENT)) }}>Sign out</button></aside></div> }

@@ -17,6 +17,11 @@ data class CollectorConfig(
 )
 
 class CollectorConfigStore(context: Context) {
+    companion object {
+        /** Centralized local backend target for normal phone-only registration. */
+        const val DEFAULT_BACKEND_URL: String = "http://192.168.10.243:4000"
+    }
+
     private val normal = context.getSharedPreferences("collector_configuration", Context.MODE_PRIVATE)
     private val encrypted = EncryptedSharedPreferences.create(
         context,
@@ -27,7 +32,7 @@ class CollectorConfigStore(context: Context) {
     )
 
     fun read() = CollectorConfig(
-        backendUrl = normal.getString("backend_url", "") ?: "",
+        backendUrl = normal.getString("backend_url", DEFAULT_BACKEND_URL)?.ifBlank { DEFAULT_BACKEND_URL } ?: DEFAULT_BACKEND_URL,
         deviceName = normal.getString("device_name", "") ?: "",
         deviceIdentifier = deviceIdentifier(),
         receiverNumber = normal.getString("receiver_number", "") ?: "",
@@ -38,6 +43,8 @@ class CollectorConfigStore(context: Context) {
     fun apiKey(): String? = encrypted.getString("collector_api_key", null)
 
     fun registrationSecret(): String? = encrypted.getString("registration_secret", null)
+
+    fun defaultBackendUrl(): String = DEFAULT_BACKEND_URL
 
     fun beginRegistration(backendUrl: String, deviceName: String, receiverNumber: String): CollectorConfig {
         if (registrationSecret().isNullOrBlank()) {

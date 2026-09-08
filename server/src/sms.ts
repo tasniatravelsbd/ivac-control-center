@@ -57,8 +57,29 @@ export async function authenticateRegistration(deviceIdentifier: string, registr
   return collector
 }
 export async function provisionCollector(input: { deviceName: string; deviceIdentifier: string; phoneNumber: string }) {
+  const phoneNumber = normalizeBangladeshPhone(input.phoneNumber)
+  if (!phoneNumber) throw new Error('INVALID_BANGLADESH_PHONE')
   const apiKey = randomBytes(32).toString('base64url')
-  const collector = await prisma.smsCollector.create({ data: { ...input, phoneNumber: normalizeBangladeshPhone(input.phoneNumber) ?? input.phoneNumber, apiKeyHash: await bcrypt.hash(apiKey, 12), events: { create: { type: 'PROVISIONED', message: 'Collector provisioned by an operator' } } } })
+  const apiKeyHash = await bcrypt.hash(apiKey, 12)
+  const collector = await prisma.$transaction(async tx => {
+    // A new device takes over this SIM number. Older credentials are invalidated
+    // so two physical phones cannot both submit SMS for the same receiver.
+    await tx.smsCollector.updateMany({
+      where: { phoneNumber, deviceIdentifier: { not: input.deviceIdentifier }, status: { not: 'DISABLED' } },
+      data: { status: 'DISABLED', apiKeyHash: await bcrypt.hash(randomBytes(32).toString('base64url'), 12) },
+    })
+    const existing = await tx.smsCollector.findUnique({ where: { deviceIdentifier: input.deviceIdentifier } })
+    const data = {
+      deviceName: input.deviceName.trim(), phoneNumber, apiKeyHash,
+      status: 'OFFLINE' as const, registrationApprovedAt: new Date(),
+      registrationSecretHash: null, encryptedRegistrationKey: null, credentialDeliveredAt: new Date(),
+    }
+    const value = existing
+      ? await tx.smsCollector.update({ where: { id: existing.id }, data })
+      : await tx.smsCollector.create({ data: { ...data, deviceIdentifier: input.deviceIdentifier } })
+    await tx.collectorEvent.create({ data: { collectorId: value.id, type: existing ? 'RECONNECTED' : 'REGISTERED', message: 'Collector registered from Android device' } })
+    return value
+  })
   return { collector, apiKey }
 }
 export async function matchIncomingSms(collectorId: string, payload: { messageUid: string; receiverNumber: string; senderNumber: string; message: string; receivedAt: Date }) {

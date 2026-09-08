@@ -15,6 +15,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -44,19 +45,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderRegistration() {
-        content.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(Button(this@MainActivity).apply {
-                text = "REGISTER DEVICE"
-                isEnabled = registrationMode != RegistrationMode.PHONE
-                setOnClickListener { registrationMode = RegistrationMode.PHONE; render() }
-            })
-            addView(Button(this@MainActivity).apply {
-                text = "PAIRING CODE"
-                isEnabled = registrationMode != RegistrationMode.PAIRING_CODE
-                setOnClickListener { registrationMode = RegistrationMode.PAIRING_CODE; render() }
-            })
-        })
         if (registrationMode == RegistrationMode.PAIRING_CODE) {
             renderPairingCode()
         } else {
@@ -66,13 +54,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderPhoneRegistration() {
         val current = config.read()
-        val backend = EditText(this).apply {
-            hint = "Backend URL"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            setText(current.backendUrl)
-        }
         val deviceName = EditText(this).apply {
-            hint = "Device name"
+            hint = "Device name (optional)"
             setText(current.deviceName.ifBlank { android.os.Build.MODEL.take(80) })
         }
         val receivingNumber = EditText(this).apply {
@@ -80,22 +63,21 @@ class MainActivity : AppCompatActivity() {
             inputType = InputType.TYPE_CLASS_PHONE
             setText(current.receiverNumber)
         }
-        content.addView(TextView(this).apply { text = "CONNECT DEVICE\nThis phone creates a secure local identity. An authenticated operator approves the exact pending device and SIM number in the Control Center. No pairing code is required." })
-        content.addView(backend)
+        content.addView(TextView(this).apply { text = "SMS COLLECTOR SETUP\nEnter the receiving SIM number to connect this device securely." })
         content.addView(deviceName)
         content.addView(receivingNumber)
         content.addView(Button(this).apply {
             text = "CONNECT DEVICE"
-            setOnClickListener { connectDevice(backend.text.toString(), deviceName.text.toString(), receivingNumber.text.toString()) }
+            setOnClickListener { connectDevice(deviceName.text.toString(), receivingNumber.text.toString()) }
         })
-        content.addView(Button(this).apply {
-            text = "CHECK REGISTRATION"
-            isEnabled = current.hasRegistrationSecret
-            setOnClickListener { checkRegistration() }
-        })
+        content.addView(Button(this).apply { text = "Advanced / Manual Pairing"; setOnClickListener { registrationMode = RegistrationMode.PAIRING_CODE; render() } })
         status = TextView(this)
         content.addView(status)
-        status.text = if (current.hasRegistrationSecret) "Registration requested. Ask an operator to approve this device, then check registration." else "Not connected. The permanent collector credential is never displayed in this app."
+        status.text = when {
+            current.backendUrl.isBlank() -> "This APK has no configured backend URL. Use Advanced / Manual Pairing or request a configured build."
+            current.hasRegistrationSecret -> "Connecting securely…"
+            else -> "Not connected. The permanent collector credential is never displayed in this app."
+        }
     }
 
     /** Legacy one-time code pairing remains available for already deployed collector APK workflows. */
@@ -119,6 +101,7 @@ class MainActivity : AppCompatActivity() {
             text = "PAIR DEVICE"
             setOnClickListener { pairDevice(backend.text.toString(), pairingCode.text.toString()) }
         })
+        content.addView(Button(this).apply { text = "Back to simple setup"; setOnClickListener { registrationMode = RegistrationMode.PHONE; render() } })
         status = TextView(this)
         content.addView(status)
         status.text = "Not paired. Use this mode only with a one-time operator pairing code."
@@ -127,19 +110,19 @@ class MainActivity : AppCompatActivity() {
     private fun renderConnected() {
         val value = config.read()
         content.addView(TextView(this).apply {
-            text = "CONNECTED\nCollector: ${value.deviceName}\nReceiving number: ${value.receiverNumber}\nBackend: ${value.backendUrl}"
+            text = "SMS COLLECTOR\n● CONNECTED\nReceiving SIM: ${value.receiverNumber}\nDevice: ${value.deviceName}\nServer: Connected"
         })
         content.addView(Button(this).apply { text = "Grant SMS permission"; setOnClickListener { requestSmsPermission.launch(Manifest.permission.RECEIVE_SMS) } })
-        content.addView(Button(this).apply { text = "Send heartbeat now"; setOnClickListener { CollectorWork.enqueueHeartbeat(this@MainActivity); refreshStatus() } })
+        content.addView(Button(this).apply { text = "SYNC NOW"; setOnClickListener { CollectorWork.enqueueHeartbeat(this@MainActivity); refreshStatus() } })
         content.addView(Button(this).apply { text = "Retry pending"; setOnClickListener { retryPending() } })
         if (BuildConfig.DEBUG) content.addView(Button(this).apply { text = "Queue TEST MESSAGE"; setOnClickListener { queueTestMessage() } })
         content.addView(Button(this).apply {
-            text = "Change backend / re-register"
+            text = "CHANGE NUMBER"
             setOnClickListener {
                 AlertDialog.Builder(this@MainActivity)
-                    .setMessage("This removes this phone's local credential and identity. Register this device again, then have an operator approve it in the Control Center.")
+                    .setMessage("This removes this phone's local credential and identity. Pending SMS messages stay on this device.")
                     .setNegativeButton("Cancel", null)
-                    .setPositiveButton("Re-register") { _, _ -> config.clearRegistration(); render() }
+                    .setPositiveButton("Change number") { _, _ -> config.clearRegistration(); render() }
                     .show()
             }
         })
@@ -148,7 +131,12 @@ class MainActivity : AppCompatActivity() {
         refreshStatus()
     }
 
-    private fun connectDevice(backendUrl: String, deviceName: String, receiverNumber: String) = lifecycleScope.launch {
+    private fun connectDevice(deviceName: String, receiverNumber: String) = lifecycleScope.launch {
+        val backendUrl = config.defaultBackendUrl()
+        if (backendUrl.isBlank()) {
+            status.text = "This APK is missing its configured backend URL. Use Advanced / Manual Pairing or request a configured build."
+            return@launch
+        }
         status.text = "Connecting device…"
         val outcome = withContext(Dispatchers.IO) {
             val current = config.beginRegistration(backendUrl, deviceName, receiverNumber)
@@ -161,9 +149,26 @@ class MainActivity : AppCompatActivity() {
             )
         }
         when (outcome) {
-            RegistrationOutcome.PendingApproval -> status.text = "Registration requested. Ask an operator to approve this exact device and SIM number, then tap Check registration."
+            RegistrationOutcome.PendingApproval -> status.text = "Registration is pending. Try Connect again shortly."
             is RegistrationOutcome.Connected -> completeConnectedRegistration(outcome)
             is RegistrationOutcome.Failed -> status.text = "Connection failed: ${outcome.code}"
+        }
+    }
+
+    /** A bounded, UI-scoped approval check avoids a persistent or rapid polling loop. */
+    private fun pollForApproval() = lifecycleScope.launch {
+        repeat(20) {
+            delay(30_000)
+            if (config.read().hasApiKey || registrationMode != RegistrationMode.PHONE) return@launch
+            val current = config.read()
+            val secret = config.registrationSecret() ?: return@launch
+            when (val outcome = withContext(Dispatchers.IO) {
+                CollectorApi(config).completeRegistration(current.backendUrl, current.deviceIdentifier, secret)
+            }) {
+                is RegistrationOutcome.Connected -> { completeConnectedRegistration(outcome); return@launch }
+                is RegistrationOutcome.Failed -> status.text = "Waiting for approval: ${outcome.code}"
+                RegistrationOutcome.PendingApproval -> status.text = "WAITING FOR APPROVAL. The app will check again shortly."
+            }
         }
     }
 

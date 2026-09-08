@@ -126,7 +126,7 @@ class CollectorApi(private val config: CollectorConfigStore) {
         }
     }
 
-    /** Requests operator approval for one securely identified device. No collector credential is sent. */
+    /** Direct phone/device registration; the returned credential is stored only in encrypted local storage. */
     fun registerDevice(
         backendUrl: String,
         deviceName: String,
@@ -134,18 +134,26 @@ class CollectorApi(private val config: CollectorConfigStore) {
         receiverNumber: String,
         registrationSecret: String,
     ): RegistrationOutcome {
-        if (deviceName.isBlank() || deviceIdentifier.isBlank() || receiverNumber.isBlank() || registrationSecret.length < 32) {
+        if (deviceName.isBlank() || deviceIdentifier.isBlank() || receiverNumber.isBlank()) {
             return RegistrationOutcome.Failed("INVALID_REGISTRATION")
         }
-        return registrationReply(unauthenticatedPost(
+        val reply = unauthenticatedPost(
             backendUrl,
-            "/api/collectors/device-registrations",
+            "/api/collectors/register",
             JSONObject()
                 .put("deviceName", deviceName.trim())
                 .put("deviceIdentifier", deviceIdentifier)
-                .put("phoneNumber", receiverNumber.trim())
-                .put("registrationSecret", registrationSecret),
-        ))
+                .put("phoneNumber", receiverNumber.trim()),
+        )
+        if (reply.statusCode !in 200..299) return registrationReply(reply)
+        return try {
+            val payload = JSONObject(reply.body ?: return RegistrationOutcome.Failed("MALFORMED_RESPONSE"))
+            val collector = payload.getJSONObject("collector")
+            val apiKey = payload.optString("apiKey").trim()
+            if (apiKey.isBlank()) RegistrationOutcome.Failed("MALFORMED_RESPONSE") else RegistrationOutcome.Connected(
+                collector.optString("deviceName"), collector.optString("deviceIdentifier"), collector.optString("phoneNumber"), apiKey,
+            )
+        } catch (_: Exception) { RegistrationOutcome.Failed("MALFORMED_RESPONSE") }
     }
 
     /** Obtains a credential only after the authenticated operator has approved this exact registration. */
