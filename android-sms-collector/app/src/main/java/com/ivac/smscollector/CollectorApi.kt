@@ -4,6 +4,7 @@ import org.json.JSONObject
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.io.IOException
 
 sealed interface UploadOutcome {
@@ -21,6 +22,19 @@ sealed interface PairingOutcome {
         val apiKey: String,
     ) : PairingOutcome
     data class Failed(val code: String) : PairingOutcome
+}
+
+sealed interface RegistrationOutcome {
+    data object PendingApproval : RegistrationOutcome
+
+    data class Connected(
+        val deviceName: String,
+        val deviceIdentifier: String,
+        val receiverNumber: String,
+        val apiKey: String,
+    ) : RegistrationOutcome
+
+    data class Failed(val code: String) : RegistrationOutcome
 }
 
 class CollectorApi(private val config: CollectorConfigStore) {
@@ -59,6 +73,111 @@ class CollectorApi(private val config: CollectorConfigStore) {
         } finally {
             connection.disconnect()
         }
+    }
+
+    private fun unauthenticatedPost(base: String, path: String, payload: JSONObject): Reply {
+        val connection = try {
+            endpoint(base, path)?.openConnection() as? HttpURLConnection
+        } catch (_: Exception) {
+            null
+        } ?: return Reply(400, null)
+        return try {
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 15_000
+            connection.readTimeout = 15_000
+            connection.doOutput = true
+            connection.setRequestProperty("Content-Type", "application/json")
+            OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { it.write(payload.toString()) }
+            val status = connection.responseCode
+            val body = (if (status in 200..299) connection.inputStream else connection.errorStream)
+                ?.bufferedReader()?.use { it.readText() }
+            Reply(status, body)
+        } catch (_: IOException) {
+            Reply(null, null)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun registrationReply(reply: Reply): RegistrationOutcome = when (reply.statusCode) {
+        202 -> RegistrationOutcome.PendingApproval
+        200 -> try {
+            val payload = JSONObject(reply.body ?: return RegistrationOutcome.Failed("MALFORMED_RESPONSE"))
+            val collector = payload.getJSONObject("collector")
+            val apiKey = payload.optString("apiKey").trim()
+            if (payload.optString("registrationStatus") != "CONNECTED" || apiKey.isBlank()) {
+                RegistrationOutcome.Failed("MALFORMED_RESPONSE")
+            } else {
+                RegistrationOutcome.Connected(
+                    deviceName = collector.optString("deviceName"),
+                    deviceIdentifier = collector.optString("deviceIdentifier"),
+                    receiverNumber = collector.optString("phoneNumber"),
+                    apiKey = apiKey,
+                )
+            }
+        } catch (_: Exception) {
+            RegistrationOutcome.Failed("MALFORMED_RESPONSE")
+        }
+        null -> RegistrationOutcome.Failed("NETWORK")
+        else -> try {
+            RegistrationOutcome.Failed(JSONObject(reply.body ?: "{}").optString("error").ifBlank { "HTTP_${reply.statusCode}" })
+        } catch (_: Exception) {
+            RegistrationOutcome.Failed("HTTP_${reply.statusCode}")
+        }
+    }
+
+    /** Requests operator approval for one securely identified device. No collector credential is sent. */
+    fun registerDevice(
+        backendUrl: String,
+        deviceName: String,
+        deviceIdentifier: String,
+        receiverNumber: String,
+        registrationSecret: String,
+    ): RegistrationOutcome {
+        if (deviceName.isBlank() || deviceIdentifier.isBlank() || receiverNumber.isBlank() || registrationSecret.length < 32) {
+            return RegistrationOutcome.Failed("INVALID_REGISTRATION")
+        }
+        return registrationReply(unauthenticatedPost(
+            backendUrl,
+            "/api/collectors/device-registrations",
+            JSONObject()
+                .put("deviceName", deviceName.trim())
+                .put("deviceIdentifier", deviceIdentifier)
+                .put("phoneNumber", receiverNumber.trim())
+                .put("registrationSecret", registrationSecret),
+        ))
+    }
+
+    /** Obtains a credential only after the authenticated operator has approved this exact registration. */
+    fun completeRegistration(
+        backendUrl: String,
+        deviceIdentifier: String,
+        registrationSecret: String,
+    ): RegistrationOutcome {
+        if (deviceIdentifier.isBlank() || registrationSecret.length < 32) {
+            return RegistrationOutcome.Failed("INVALID_REGISTRATION")
+        }
+        val encodedId = URLEncoder.encode(deviceIdentifier, Charsets.UTF_8.name())
+        val connection = try {
+            endpoint(backendUrl, "/api/collectors/device-registrations/$encodedId")?.openConnection() as? HttpURLConnection
+        } catch (_: Exception) {
+            null
+        } ?: return RegistrationOutcome.Failed("INVALID_BACKEND_URL")
+        val reply = try {
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 15_000
+            connection.readTimeout = 15_000
+            connection.setRequestProperty("X-Registration-Secret", registrationSecret)
+            val status = connection.responseCode
+            val body = (if (status in 200..299) connection.inputStream else connection.errorStream)
+                ?.bufferedReader()?.use { it.readText() }
+            Reply(status, body)
+        } catch (_: IOException) {
+            Reply(null, null)
+        } finally {
+            connection.disconnect()
+        }
+        return registrationReply(reply)
     }
 
     /** Exchanges a short-lived code once. This request deliberately has no collector credential yet. */
